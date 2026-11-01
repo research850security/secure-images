@@ -1,0 +1,115 @@
+name: base
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_calls:
+        description: Docker Hub calls the build may make
+        default: "30000"
+
+permissions: {}
+
+concurrency:
+  group: base
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - id: main-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.MAIN_REPO }}
+          permission-contents: read
+
+      - name: Download the worker
+        env:
+          GH_TOKEN: ${{ steps.main-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.MAIN_REPO }}
+        run: |
+          gh api "repos/$REPO/contents/deploy/fleet.json" -H "Accept: application/vnd.github.raw" > fleet.json
+          gh release download "$(jq -r .worker_version fleet.json)" --repo "$REPO" \
+            --pattern "*-x86_64-unknown-linux-gnu*" --dir bin
+          cd bin
+          sha256sum -c ./*.sha256
+          mv ./*-x86_64-unknown-linux-gnu worker
+          chmod +x worker
+
+      - id: data-read-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.DATA_REPO }}
+          permission-contents: read
+
+      - name: Download the current denylist
+        env:
+          GH_TOKEN: ${{ steps.data-read-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.DATA_REPO }}
+        run: |
+          if ! names=$(gh api "repos/$REPO/contents/denylist" --jq '.[].name' 2> error.txt); then
+            grep -q "HTTP 404" error.txt || { cat error.txt; exit 1; }
+            echo "no denylist yet, starting from an empty one"
+            exit 0
+          fi
+          for name in baselayers.bin baselayers.bin.manifests; do
+            if grep -qx "$name" <<< "$names"; then
+              gh api "repos/$REPO/contents/denylist/$name" -H "Accept: application/vnd.github.raw" > "$name"
+            fi
+          done
+
+      - id: build
+        name: Build the denylist
+        env:
+          MAX_CALLS: ${{ inputs.max_calls || '30000' }}
+        run: |
+          status=0
+          ./bin/worker build-denylist --out baselayers.bin --max-calls "$MAX_CALLS" > build.log 2>&1 || status=$?
+          grep -v "^error:" build.log || true
+          echo "errors: $(grep -c "^error:" build.log || true)"
+          exit "$status"
+
+      - id: data-write-token
+        if: always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure')
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.DATA_REPO }}
+          permission-contents: write
+
+      - name: Upload the denylist and the log
+        if: always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ steps.data-write-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.DATA_REPO }}
+        run: |
+          upload() {
+            [ -f "$1" ] || return 0
+            base64 -w 0 "$1" > upload.b64
+            sha=$(gh api "repos/$REPO/contents/$2" --jq .sha 2> /dev/null) || sha=""
+            jq -n --arg message "update $2" --rawfile content upload.b64 --arg sha "$sha" \
+              '{message: $message, content: $content} + (if $sha == "" then {} else {sha: $sha} end)' > body.json
+            for attempt in 1 2 3 4 5; do
+              if gh api -X PUT "repos/$REPO/contents/$2" --input body.json > /dev/null; then
+                return 0
+              fi
+              echo "upload of $2 failed, attempt $attempt"
+              sleep $((10 + RANDOM % 31))
+            done
+            return 1
+          }
+          upload baselayers.bin denylist/baselayers.bin
+          upload baselayers.bin.manifests denylist/baselayers.bin.manifests
+          gzip -9 -c build.log > build.log.gz
+          upload build.log.gz "logs/$(date -u +%F)/denylist-${{ github.run_id }}-${{ github.run_attempt }}.log.gz"
