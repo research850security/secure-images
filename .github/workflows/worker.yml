@@ -1,0 +1,164 @@
+name: sync
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_runtime_mins:
+        description: Minutes each job runs
+        default: "330"
+
+permissions: {}
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(vars.SLOTS) }}
+    concurrency:
+      group: shard-${{ matrix.slot }}
+      cancel-in-progress: false
+    steps:
+      - id: main-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.MAIN_REPO }}
+          permission-contents: read
+
+      - id: fleet
+        name: Read the fleet file
+        env:
+          GH_TOKEN: ${{ steps.main-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.MAIN_REPO }}
+          ORG: ${{ github.repository_owner }}
+          SLOT: ${{ matrix.slot }}
+        run: |
+          gh api "repos/$REPO/contents/deploy/fleet.json" -H "Accept: application/vnd.github.raw" > fleet.json
+          index=$(jq --arg org "$ORG" '[.orgs[].org] | index($org)' fleet.json)
+          if [ "$index" = null ]; then
+            echo "org $ORG is not in the fleet file"
+            exit 1
+          fi
+          slots=$(jq ".orgs[$index].slots" fleet.json)
+          if [ "$SLOT" -ge "$slots" ]; then
+            echo "slot $SLOT is not in use, the org has $slots slots"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          offset=$(jq "[.orgs[:$index][].slots] | add // 0" fleet.json)
+          count=$(jq '[.orgs[].slots] | add' fleet.json)
+          id=$((offset + SLOT))
+          echo "shard $id/$count"
+          {
+            echo "run=true"
+            echo "shard=$id/$count"
+            echo "key=$id-of-$count"
+            echo "version=$(jq -r .worker_version fleet.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the worker
+        if: steps.fleet.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.main-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.MAIN_REPO }}
+          VERSION: ${{ steps.fleet.outputs.version }}
+        run: |
+          gh release download "$VERSION" --repo "$REPO" --pattern "*-x86_64-unknown-linux-gnu*" --dir bin
+          cd bin
+          sha256sum -c ./*.sha256
+          mv ./*-x86_64-unknown-linux-gnu worker
+          chmod +x worker
+
+      - id: data-read-token
+        if: steps.fleet.outputs.run == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.DATA_REPO }}
+          permission-contents: read
+
+      - name: Download the base denylist
+        if: steps.fleet.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.data-read-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.DATA_REPO }}
+        run: |
+          gh api "repos/$REPO/contents/denylist/baselayers.bin" -H "Accept: application/vnd.github.raw" > baselayers.bin
+
+      - name: Restore the seen-layer set
+        if: steps.fleet.outputs.run == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: state
+          key: seen-${{ steps.fleet.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: seen-${{ steps.fleet.outputs.key }}-
+
+      - id: worker
+        name: Run the worker
+        if: steps.fleet.outputs.run == 'true'
+        env:
+          SHARD: ${{ steps.fleet.outputs.shard }}
+          RUNTIME: ${{ inputs.max_runtime_mins || '330' }}
+        run: |
+          status=0
+          ./bin/worker worker --resolve-only --shard "$SHARD" --state-dir state \
+            --metrics metrics.jsonl --denylist baselayers.bin \
+            --max-runtime-mins "$RUNTIME" > worker.log 2>&1 || status=$?
+          last=$(tail -n 1 worker.log)
+          case "$last" in
+            done:*) echo "$last" ;;
+            *) echo "the worker stopped early, the log is in the data repo" ;;
+          esac
+          exit "$status"
+
+      - name: Save the seen-layer set
+        if: always() && (steps.worker.outcome == 'success' || steps.worker.outcome == 'failure')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: state
+          key: seen-${{ steps.fleet.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - id: data-write-token
+        if: always() && (steps.worker.outcome == 'success' || steps.worker.outcome == 'failure')
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ secrets.APP_OWNER }}
+          repositories: ${{ secrets.DATA_REPO }}
+          permission-contents: write
+
+      - name: Upload the metrics and the log
+        if: always() && (steps.worker.outcome == 'success' || steps.worker.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ steps.data-write-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.DATA_REPO }}
+          NAME: ${{ steps.fleet.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          day=$(date -u +%F)
+          upload() {
+            [ -f "$1" ] || return 0
+            gzip -9 -c "$1" > upload.gz
+            base64 -w 0 upload.gz > upload.b64
+            jq -n --arg message "add $2" --rawfile content upload.b64 \
+              '{message: $message, content: $content}' > body.json
+            for attempt in 1 2 3 4 5; do
+              if gh api -X PUT "repos/$REPO/contents/$2" --input body.json > /dev/null; then
+                return 0
+              fi
+              echo "upload of $2 failed, attempt $attempt"
+              sleep $((10 + RANDOM % 31))
+            done
+            return 1
+          }
+          upload metrics.jsonl "metrics/$day/$NAME.jsonl.gz"
+          upload worker.log "logs/$day/$NAME.log.gz"
