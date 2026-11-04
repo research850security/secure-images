@@ -7,7 +7,7 @@ on:
     inputs:
       max_runtime_mins:
         description: Minutes each job runs
-        default: "330"
+        default: "30"
 
 permissions: {}
 
@@ -108,10 +108,16 @@ jobs:
         env:
           SHARD: ${{ steps.fleet.outputs.shard }}
           RUNTIME: ${{ inputs.max_runtime_mins || '330' }}
+          RECIPIENT: ${{ vars.AGE_RECIPIENT }}
         run: |
+          if [ -z "$RECIPIENT" ]; then
+            echo "AGE_RECIPIENT repository variable is required for scan mode"
+            exit 1
+          fi
           status=0
-          ./bin/worker worker --resolve-only --shard "$SHARD" --state-dir state \
-            --metrics metrics.jsonl --denylist baselayers.bin \
+          ./bin/worker worker --shard "$SHARD" --state-dir state \
+            --metrics metrics.jsonl --denylist baselayers.bin --recipient "$RECIPIENT" \
+            --bundles findings \
             --max-runtime-mins "$RUNTIME" > worker.log 2>&1 || status=$?
           last=$(tail -n 1 worker.log)
           case "$last" in
@@ -162,3 +168,37 @@ jobs:
           }
           upload metrics.jsonl "metrics/$day/$NAME.jsonl.gz"
           upload worker.log "logs/$day/$NAME.log.gz"
+
+      - name: Upload results
+        if: always() && (steps.worker.outcome == 'success' || steps.worker.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ steps.data-write-token.outputs.token }}
+          REPO: ${{ secrets.APP_OWNER }}/${{ secrets.DATA_REPO }}
+          NAME: ${{ steps.fleet.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          [ -d findings ] || exit 0
+          day=$(date -u +%F)
+          upload_bundle() {
+            local file=$1 path="bundles/$day/$NAME-$(basename "$1")"
+            base64 -w 0 "$file" > upload.b64
+            jq -n --arg message "add encrypted finding bundle" --rawfile content upload.b64 \
+              '{message: $message, content: $content}' > body.json
+            for attempt in 1 2 3 4 5; do
+              if gh api -X PUT "repos/$REPO/contents/$path" --input body.json > /dev/null; then
+                echo "uploaded encrypted bundle $path"
+                return 0
+              fi
+              # A request may have committed even when its response was lost.
+              if gh api "repos/$REPO/contents/$path" > /dev/null 2>&1; then
+                echo "bundle already exists: $path"
+                return 0
+              fi
+              echo "upload of $path failed, attempt $attempt"
+              sleep $((10 + RANDOM % 31))
+            done
+            echo "failed to upload encrypted bundle $path after 5 attempts" >&2
+            return 1
+          }
+          while IFS= read -r -d '' file; do
+            upload_bundle "$file"
+          done < <(find findings -type f -name '*.age' -print0 | sort -z)
